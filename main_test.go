@@ -11,7 +11,7 @@ import (
 type TestMockAPIClient struct {
 	MockAPIClient
 	CalledRecords []ExternalRecord // Records passed to CreateRecord
-	CallErrors    []error         // Sequence of errors to return (for retry testing)
+	CallErrors    []error          // Sequence of errors to return (for retry testing)
 	callIndex     int
 }
 
@@ -55,18 +55,18 @@ func TestNewSyncerFactory(t *testing.T) {
 
 func TestCRM1SyncerSync(t *testing.T) {
 	tests := []struct {
-		name           string
-		rec            InternalRecord
-		limiterTokens  int
-		apiCallErrors  []error // For retry simulation
-		wantErr        bool
-		wantCalledRec  ExternalRecord
-		wantDLQ        bool // Expect permanent failure
+		name          string
+		rec           InternalRecord
+		initialTokens int
+		apiCallErrors []error // For retry simulation
+		wantErr       bool
+		wantCalledRec ExternalRecord
+		wantDLQ       bool // Expect permanent failure
 	}{
 		{
 			name:          "Success",
 			rec:           InternalRecord{ID: "1", Name: "John Doe", Email: "john@example.com"},
-			limiterTokens: 1,
+			initialTokens: 1,
 			apiCallErrors: nil,
 			wantErr:       false,
 			wantCalledRec: ExternalRecord{Id: "1", FullName: "John Doe", ContactEmail: "john@example.com"},
@@ -75,7 +75,7 @@ func TestCRM1SyncerSync(t *testing.T) {
 		{
 			name:          "Validation Failure",
 			rec:           InternalRecord{ID: "", Name: "John Doe", Email: "john@example.com"},
-			limiterTokens: 1,
+			initialTokens: 1,
 			apiCallErrors: nil,
 			wantErr:       true,
 			wantCalledRec: ExternalRecord{}, // No call
@@ -84,43 +84,43 @@ func TestCRM1SyncerSync(t *testing.T) {
 		{
 			name:          "Rate Limit Exceeded With Retry Success",
 			rec:           InternalRecord{ID: "1", Name: "John Doe", Email: "john@example.com"},
-			limiterTokens: 0, // Initial no tokens
+			initialTokens: 0, // Will consume initial token to simulate exceed
 			apiCallErrors: nil,
 			wantErr:       false,
 			wantCalledRec: ExternalRecord{Id: "1", FullName: "John Doe", ContactEmail: "john@example.com"},
 			wantDLQ:       false,
 		},
 		{
-			name:           "Transient Failure Retry Success",
-			rec:            InternalRecord{ID: "1", Name: "John Doe", Email: "john@example.com"},
-			limiterTokens:  1,
-			apiCallErrors:  []error{errors.New("transient"), nil}, // Fail first, succeed second
-			wantErr:        false,
-			wantCalledRec:  ExternalRecord{Id: "1", FullName: "John Doe", ContactEmail: "john@example.com"},
-			wantDLQ:        false,
+			name:          "Transient Failure Retry Success",
+			rec:           InternalRecord{ID: "1", Name: "John Doe", Email: "john@example.com"},
+			initialTokens: 1,
+			apiCallErrors: []error{errors.New("transient"), nil}, // Fail first, succeed second
+			wantErr:       false,
+			wantCalledRec: ExternalRecord{Id: "1", FullName: "John Doe", ContactEmail: "john@example.com"},
+			wantDLQ:       false,
 		},
 		{
-			name:           "Permanent Failure To DLQ",
-			rec:            InternalRecord{ID: "1", Name: "John Doe", Email: "john@example.com"},
-			limiterTokens:  1,
-			apiCallErrors:  []error{errors.New("permanent"), errors.New("permanent"), errors.New("permanent"), errors.New("permanent")},
-			wantErr:        true,
-			wantCalledRec:  ExternalRecord{Id: "1", FullName: "John Doe", ContactEmail: "john@example.com"},
-			wantDLQ:        true, // Expect error after 3 retries
+			name:          "Permanent Failure To DLQ",
+			rec:           InternalRecord{ID: "1", Name: "John Doe", Email: "john@example.com"},
+			initialTokens: 1,
+			apiCallErrors: []error{errors.New("permanent"), errors.New("permanent"), errors.New("permanent"), errors.New("permanent")},
+			wantErr:       true,
+			wantCalledRec: ExternalRecord{Id: "1", FullName: "John Doe", ContactEmail: "john@example.com"},
+			wantDLQ:       true, // Expect error after 3 retries
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Given: Setup limiter (with initial tokens), client with error sequence
-			limiter := NewTokenBucketLimiter(tt.limiterTokens, time.Millisecond) // Fast refill for test
+			// Given: Setup limiter with max=1, fast refill; adjust initial by consuming if needed
+			limiter := NewTokenBucketLimiter(1, time.Millisecond)
+			if tt.initialTokens == 0 {
+				limiter.Acquire() // Consume to simulate initial=0
+			}
 			client := &TestMockAPIClient{CallErrors: tt.apiCallErrors}
 			syncer := &CRM1Syncer{rateLimiter: limiter, apiClient: client}
 
-			// When: Perform sync (with small sleep for refill if needed)
-			if tt.limiterTokens == 0 {
-				time.Sleep(2 * time.Millisecond) // Allow refill
-			}
+			// When: Perform sync
 			err := syncer.Sync(context.Background(), tt.rec)
 
 			// Then: Assert error, called record, and DLQ implication
@@ -129,7 +129,7 @@ func TestCRM1SyncerSync(t *testing.T) {
 			}
 			if len(client.CalledRecords) > 0 {
 				if client.CalledRecords[len(client.CalledRecords)-1] != tt.wantCalledRec {
-					t.Errorf("Called record = %+v, want %+v", client.CalledRecords[0], tt.wantCalledRec)
+					t.Errorf("Called record = %+v, want %+v", client.CalledRecords[len(client.CalledRecords)-1], tt.wantCalledRec)
 				}
 			} else if tt.wantCalledRec != (ExternalRecord{}) {
 				t.Error("Expected API call but none made")
@@ -157,7 +157,7 @@ func TestCRM2SyncerSync(t *testing.T) {
 		if err != nil {
 			t.Errorf("Sync() error = %v, want nil", err)
 		}
-		wantRec := ExternalRecord{Id: "1", FirstName: "John ", LastName: "Doe"} // Based on naive split
+		wantRec := ExternalRecord{Id: "1", FirstName: "John", LastName: "Doe"}
 		if len(client.CalledRecords) != 1 || client.CalledRecords[0] != wantRec {
 			t.Errorf("Called record = %+v, want %+v", client.CalledRecords[0], wantRec)
 		}
